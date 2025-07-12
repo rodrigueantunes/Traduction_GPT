@@ -50,7 +50,7 @@ pip install openai pandas openpyxl
 1. **Lancer l’application :**
 
 ```bash
-python traducteur_excel_openai.py
+python Traduction_GPT.py
 ```
 
 2. **Charger un fichier XLSX** à traduire (le fichier doit contenir une colonne `fr`).
