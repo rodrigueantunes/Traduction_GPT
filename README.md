@@ -123,7 +123,7 @@ python traducteur_excel_openai.py
 ## 📦 Distribution & Licence
 
 * Projet distribué **librement** pour un usage professionnel ou personnel.
-* **Licence :** MIT (à adapter selon vos besoins)
+* **Licence :** MIT 
 * **Aucune affiliation** avec OpenAI.
 
 ---
