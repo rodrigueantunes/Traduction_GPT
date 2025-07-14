@@ -18,6 +18,7 @@ import threading
 import json
 from datetime import datetime
 import subprocess
+import tiktoken
 import sys
 
 # ------------------- Gestion des clés API -----------------------
@@ -115,14 +116,17 @@ def open_example_model():
 # --------------------------------------------------------------
 
 MODEL_PRICING = {
-    "gpt-4o":       {"input": 0.0005, "output": 0.0015},
-    "gpt-4-turbo":  {"input": 0.01,   "output": 0.03},
-    "gpt-3.5-turbo":{"input": 0.0005, "output": 0.0015},
-    "gpt-4":        {"input": 0.03,   "output": 0.06},
+    # Tarifs OpenAI officiels au 1er juillet 2025 (USD pour 1 000 tokens)
+    "gpt-4o":            {"input": 0.005,  "output": 0.015},
+    "gpt-4o-mini":       {"input": 0.0025, "output": 0.0075},
+    "gpt-4-turbo":       {"input": 0.01,   "output": 0.03},
+    "gpt-4":             {"input": 0.03,   "output": 0.06},
+    "gpt-3.5-turbo":     {"input": 0.0005, "output": 0.0015},
     "gpt-3.5-turbo-0125":{"input": 0.0005, "output": 0.0015},
-    "o3":           {"input": 0.03,   "output": 0.06},
-    "o3-pro":       {"input": 0.02,   "output": 0.08},
+    "o3":                {"input": 0.03,   "output": 0.06},    # à ajuster si besoin
+    "o3-pro":            {"input": 0.02,   "output": 0.08},
 }
+
 MODEL_LIST = list(MODEL_PRICING.keys())
 
 LANGUAGES = {
@@ -146,24 +150,47 @@ PROMPT_TEMPLATE = (
 LOG_EVERY = 10
 current_df = None
 current_lang = LANGUAGE_LIST[0]
+total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+CORRECTION_FILE = "estimation_correction.json"
+
+def load_correction_factor():
+    if os.path.exists(CORRECTION_FILE):
+        try:
+            with open(CORRECTION_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("correction_factor", 1.0)
+        except:
+            pass
+    return 1.0  # Par défaut pas de correction
+
+def save_correction_factor(factor):
+    with open(CORRECTION_FILE, "w", encoding="utf-8") as f:
+        json.dump({"correction_factor": factor}, f)
+
 
 def estimate_cost(df, model):
-    if df is None or 'fr' not in df.columns:
+    # 1 token ≈ 4 chars ; output tokens ~ 0.8 * input tokens
+    if 'fr' not in df.columns:
         return 0.0
-    nb_chars_in = df['fr'].dropna().astype(str).map(len).sum()
-    nb_chars_out = nb_chars_in * 1.1
-    nb_tokens_in = nb_chars_in // 4
-    nb_tokens_out = nb_chars_out // 4
+    frs = df['fr'].dropna().astype(str)
+    frs = frs[frs.str.strip() != ""]
+    nb_chars = frs.map(len).sum()
+    nb_tokens = nb_chars // 4
+    output_tokens = int(nb_tokens * 0.8)
     price = MODEL_PRICING[model]
-    cost_in = nb_tokens_in * price['input'] / 1000
-    cost_out = nb_tokens_out * price['output'] / 1000
-    return round(cost_in + cost_out, 4)
+    cost = (nb_tokens/1000)*price['input'] + (output_tokens/1000)*price['output']
+    correction = load_correction_factor()
+    return round(cost * correction, 4)
+
+
+
 
 def update_cost_estimate():
     model = model_var.get()
     if current_df is not None:
-        total = len(current_df)
+        total = len(current_df[current_df['fr'].astype(str).str.strip() != ""])
         cost = estimate_cost(current_df, model)
+        print(f"[UI UPDATE] {total} lignes → estimation coût: {cost} $ ({model})")
         cost_var.set(f"Prévision : {total} lignes – coût estimé {cost} $ ({model})")
     else:
         cost_var.set("Prévision : –")
@@ -200,13 +227,16 @@ def on_language_change(event=None):
 
 def call_openai(prompt, apikey, model):
     openai.api_key = apikey
-    response = openai.ChatCompletion.create(
+    resp = openai.ChatCompletion.create(
         model=model,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role":"user","content":prompt}],
         temperature=0.0,
         max_tokens=512
     )
-    return response.choices[0].message.content.strip()
+    usage = resp['usage']
+    total_usage["prompt_tokens"]    += usage.get("prompt_tokens", 0)
+    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+    return resp.choices[0].message.content.strip()
 
 def export_log(log_lines, original_path):
     basename = os.path.splitext(os.path.basename(original_path))[0]
@@ -264,11 +294,17 @@ def translate_file():
             continue
         prompt = PROMPT_TEMPLATE.format(lang_prompt=lang_info["prompt"], fr_text=fr)
         try:
-            trad = call_openai(prompt, apikey, model).strip()
-            # Supprime " ou ' au début et à la fin si présent
+            trad = call_openai(prompt, apikey, model)
+            if not trad or trad.strip() == "":
+                df.at[idx, col_trad] = ""
+                df.at[idx, "statut"] = "Erreur : réponse vide"
+                log_lines.append(f"{idx+1}\tERREUR\tFR: {fr[:30]}...\tRéponse vide")
+                continue
+            trad = trad.strip()
+            # Retire un seul couple de guillemets si présents, mais écrit toujours le résultat
             if (trad.startswith('"') and trad.endswith('"')) or (trad.startswith("'") and trad.endswith("'")):
                 trad = trad[1:-1].strip()
-                df.at[idx, col_trad] = trad
+            df.at[idx, col_trad] = trad
             df.at[idx, "statut"] = "OK"
             log_lines.append(f"{idx+1}\tOK\tFR: {fr[:30]}...\t{lang_code.upper()}: {trad[:30]}...")
         except Exception as e:
@@ -291,6 +327,12 @@ def translate_file():
         defaultextension=".xlsx",
         filetypes=[("Excel files", "*.xlsx"), ("CSV", "*.csv")]
     )
+
+    price = MODEL_PRICING[model]
+    real_cost = (total_usage["prompt_tokens"]/1000)*price['input'] \
+              + (total_usage["completion_tokens"]/1000)*price['output']
+    print(f"Coût réel : {real_cost:.4f} $")
+
     if out_path:
         if out_path.endswith(".xlsx"):
             df.to_excel(out_path, index=False)
@@ -298,13 +340,23 @@ def translate_file():
             df.to_csv(out_path, index=False, encoding="cp1252", quoting=1)
         elapsed = (datetime.now() - start_time).total_seconds()
         final_cost = estimate_cost(df, model)
+
+        if final_cost > 0:
+            new_factor = real_cost / final_cost
+            save_correction_factor(new_factor)
+            print(f"Facteur correction mis à jour : {new_factor:.3f}")
+        else:
+            print("Impossible de corriger le facteur (estimation nulle)")
+
         messagebox.showinfo(
             "Fini",
             f"Traduction terminée et sauvegardée :\n{out_path}\n\n"
             f"Log détaillé : {log_path}\n"
             f"Temps écoulé : {int(elapsed)} sec\n"
-            f"Coût estimé total : ~{final_cost} $"
+            f"Coût estimé total : ~{final_cost} $\n"
+            f"Coût réel OpenAI : {real_cost:.4f} $"
         )
+
 
 def threaded_translate():
     t = threading.Thread(target=translate_file)
